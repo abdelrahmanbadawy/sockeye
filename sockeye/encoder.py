@@ -593,7 +593,7 @@ class ConvolutionalEmbeddingConfig(Config):
     Convolutional embedding encoder configuration.
 
     :param num_embed: Input embedding size.
-    :param output_dim: Output segment embedding size.
+    :param output_dim: Output segment embedding size, 0 for total size of all filters (no projection).
     :param max_filter_width: Maximum filter width for convolutions.
     :param num_filters: Number of filters of each width.
     :param pool_stride: Stride for pooling layer after convolutions.
@@ -603,7 +603,7 @@ class ConvolutionalEmbeddingConfig(Config):
 
     def __init__(self,
                  num_embed: int,
-                 output_dim: int = None,
+                 output_dim: int = 512,
                  max_filter_width: int = 8,
                  num_filters: Tuple[int] = (200, 200, 250, 250, 300, 300, 300, 300),
                  pool_stride: int = 5,
@@ -619,8 +619,6 @@ class ConvolutionalEmbeddingConfig(Config):
         self.num_highway_layers = num_highway_layers
         self.dropout = dropout
         self.add_positional_encoding = add_positional_encoding
-        if self.output_dim is None:
-            self.output_dim = sum(self.num_filters)
 
 
 class ConvolutionalEmbeddingEncoder(Encoder):
@@ -655,9 +653,6 @@ class ConvolutionalEmbeddingEncoder(Encoder):
         self.conv_bias = {filter_width: mx.sym.Variable("%s%s%d%s" % (self.prefix, "conv_", filter_width, "_bias"))
                           for filter_width in range(1, self.max_filter_width + 1)}
 
-        self.project_weight = mx.sym.Variable(self.prefix + "project_weight")
-        self.project_bias = mx.sym.Variable(self.prefix + "project_bias")
-
         self.gate_weight = [mx.sym.Variable("%s%s%d%s" % (self.prefix, "gate_", i, "_weight"))
                             for i in range(self.num_highway_layers)]
         self.gate_bias = [mx.sym.Variable("%s%s%d%s" % (self.prefix, "gate_", i, "_bias"))
@@ -667,6 +662,9 @@ class ConvolutionalEmbeddingEncoder(Encoder):
                                  for i in range(self.num_highway_layers)]
         self.transform_bias = [mx.sym.Variable("%s%s%d%s" % (self.prefix, "transform_", i, "_bias"))
                                for i in range(self.num_highway_layers)]
+
+        self.project_weight = mx.sym.Variable(self.prefix + "project_weight")
+        self.project_bias = mx.sym.Variable(self.prefix + "project_bias")
 
     def encode(self,
                data: mx.sym.Symbol,
@@ -735,9 +733,29 @@ class ConvolutionalEmbeddingEncoder(Encoder):
         # (batch_size * seq_len/stride, total_num_filters)
         seg_embedding = mx.sym.Reshape(data=pool, shape=(-3, total_num_filters))
 
-        # Projection layer if requested output dimension is different from total number of filters
-        # (TransformerEncoder compatibility, not in original paper)
-        if self.output_dim != total_num_filters:
+        # Highway network
+        for i in range(self.num_highway_layers):
+            # Gate
+            gate = mx.sym.FullyConnected(data=seg_embedding,
+                                         num_hidden=total_num_filters,
+                                         weight=self.gate_weight[i],
+                                         bias=self.gate_bias[i])
+            gate = mx.sym.Activation(data=gate, act_type="sigmoid")
+            if self.dropout > 0:
+                gate = mx.sym.Dropout(data=gate, p=self.dropout)
+            # Transform
+            transform = mx.sym.FullyConnected(data=seg_embedding,
+                                              num_hidden=total_num_filters,
+                                              weight=self.transform_weight[i],
+                                              bias=self.transform_bias[i])
+            transform = mx.sym.Activation(data=transform, act_type="relu")
+            if self.dropout > 0:
+                transform = mx.sym.Dropout(data=transform, p=self.dropout)
+            # Connection
+            seg_embedding = gate * transform + (1 - gate) * seg_embedding
+
+        # Projection layer (not part of original paper)
+        if self.output_dim > 0:
             # (batch_size * seq_len/stride, outut_dim)
             seg_embedding = mx.sym.FullyConnected(data=seg_embedding,
                                                   num_hidden=self.output_dim,
@@ -746,39 +764,20 @@ class ConvolutionalEmbeddingEncoder(Encoder):
             seg_embedding = mx.sym.Activation(data=seg_embedding, act_type="relu")
             if self.dropout > 0:
                 seg_embedding = mx.sym.Dropout(data=seg_embedding, p=self.dropout)
+        final_embedding_size = self.output_dim if self.output_dim > 0 else total_num_filters
 
-        # Highway network
-        for i in range(self.num_highway_layers):
-            # Gate
-            gate = mx.sym.FullyConnected(data=seg_embedding,
-                                         num_hidden=self.output_dim,
-                                         weight=self.gate_weight[i],
-                                         bias=self.gate_bias[i])
-            gate = mx.sym.Activation(data=gate, act_type="sigmoid")
-            if self.dropout > 0:
-                gate = mx.sym.Dropout(data=gate, p=self.dropout)
-            # Transform
-            transform = mx.sym.FullyConnected(data=seg_embedding,
-                                              num_hidden=self.output_dim,
-                                              weight=self.transform_weight[i],
-                                              bias=self.transform_bias[i])
-            transform = mx.sym.Activation(data=transform, act_type="relu")
-            if self.dropout > 0:
-                transform = mx.sym.Dropout(data=transform, p=self.dropout)
-            # Connection
-            seg_embedding = gate * transform + (1 - gate) * seg_embedding
-        # (batch_size, seq_len/stride, outut_dim) aka
+        # (batch_size, seq_len/stride, final_embed_size) aka
         # (batch_size, encoded_seq_len, num_segment_emded)
         seg_embedding = mx.sym.Reshape(data=seg_embedding,
-                                       shape=(-1, encoded_seq_len, self.output_dim))
+                                       shape=(-1, encoded_seq_len, final_embedding_size))
 
         # If specified, add positional encodings to segment embeddings
-        # (TransformerEncoder compatibility, not in original paper)
+        # (TransformerEncoder compatibility, not part of original paper)
         if self.add_positional_encoding:
             seg_embedding = mx.sym.broadcast_add(seg_embedding,
                                                  Embedding.get_positional_encoding(
                                                      length=encoded_seq_len,
-                                                     depth=self.output_dim,
+                                                     depth=final_embedding_size,
                                                      name="%spositional_encodings" % self.prefix),
                                                  name='%sadd_positional_encodings' % self.prefix)
 
